@@ -1,0 +1,44 @@
+#Ignore project files
+*.wpr
+*.wpu
+*.userprefs
+*.idea
+
+#Ignore development installs
+*.egg-info
+
+#Ignore python compilations
+*.pyc
+*.pyo
+*.pyd
+
+#Ignore python coverage files ... only collects output
+*.coverage
+
+#Ignore C compilations
+*.so
+*.o
+
+#Ignore temporary swap files
+*.swp
+
+#Ingore the built lightkeeper installer
+lightkeeper.zip
+
+#Local directory build info
+build/
+dist/
+
+#Mac index files
+.DS_Store
+
+#OmniGraffle Temp Files
+*(Autosaved).graffle
+
+#ignore backup files
+*.bak
+*.orig
+
+# ignore
+distribute*.egg
+distribute*.tar.gz

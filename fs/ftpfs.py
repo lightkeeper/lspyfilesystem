@@ -991,22 +991,23 @@ class FTPFS(FS):
             ftp_features = _get_FEAT(self.ftp)
             if 'MLST' in ftp_features:
                 self.use_mlst = True
-                try:
-                    # only request the facts we need
-                    self.ftp.sendcmd("OPTS MLST type;unique;size;modify;")
-                except error_perm:
-                    # some FTP servers don't support OPTS MLST
-                    pass
+                available_features = ftp_features['MLST'].split(';')
+                featureMap = {feature.lower().rstrip('*'):feature.rstrip('*') for feature in available_features}
+                features =[featureMap[name] for name in ['type', 'unique', 'size', 'modify'] if name in featureMap]
+                if len(features) > 0:
+                    try:
+                        # only request the facts we need by building from the MLST list
+                        self.ftp.sendcmd("OPTS MLST {};".format(';'.join(features)))
+                    except error_perm:
+                        # some FTP servers don't support OPTS MLST
+                        pass
                 # need to send MLST first to discover if it's file or dir
                 response = self.ftp.sendcmd("MLST " + encoded_path)
                 lines = response.splitlines()
                 if lines[0][:3] == "250":
-                    list_line = lines[1]
                     # MLST line is preceded by space
-                    if list_line[0] == ' ':
-                        on_line(list_line[1:])
-                    else: # Matrix FTP server has bug
-                        on_line(list_line)
+                    list_line = lines[1].lstrip()
+                    on_line(list_line)
                 # if it's a dir, then we can send a MLSD
                 if dirlist[dirlist.keys()[0]]['try_cwd']:
                     dirlist = {}
