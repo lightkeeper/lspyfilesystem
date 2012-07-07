@@ -119,6 +119,9 @@ class SFTPFS(FS):
         super(SFTPFS, self).__init__()
         self.root_path = abspath(normpath(root_path))
 
+        self.pool = Queue.Queue(maxsize=max_pool_size)
+        self.pool_count = 0
+
         if isinstance(connection,paramiko.Channel):
             self._transport = None
             self._client = paramiko.SFTPClient(connection)
@@ -177,9 +180,6 @@ class SFTPFS(FS):
                 raise RemoteConnectionError(msg='SSH exception (%s)' % str(e), details=e)
 
         self._transport = connection
-
-        self.pool = Queue.Queue(maxsize=max_pool_size)
-        self.pool_count = 0
 
     def __unicode__(self):
         return u'<SFTPFS: %s>' % self.desc('/')
@@ -295,8 +295,13 @@ class SFTPFS(FS):
     def close(self):
         """Close the connection to the remote server."""
         if not self.closed:
-            for client in self.pool.get_nowait():
-                client.get_channel().close()
+            while True:
+                try:
+                    client = self.pool.get_nowait()
+                    if client:
+                        client.get_channel().close()
+                except Queue.Empty:
+                    break
             if self._owns_transport and self._transport and self._transport.is_active:
                 self._transport.close()
             self.closed = True
