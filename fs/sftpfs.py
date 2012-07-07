@@ -7,10 +7,17 @@ fs.sftpfs
 Filesystem accessing an SFTP server (via paramiko)
 
 """
+import sys
+if 'gevent.monkey' in sys.modules:
+    from gevent import queue as Queue
+    from gevent import sleep
+else:
+    import Queue
+    from time import sleep
+import contextlib
 
 import datetime
 import stat as statinfo
-import threading
 import os
 import paramiko
 from getpass import getuser
@@ -22,27 +29,6 @@ from fs.utils import isdir, isfile
 
 class WrongHostKeyError(RemoteConnectionError):
     pass
-
-# SFTPClient appears to not be thread-safe, so we use an instance per thread
-if hasattr(threading, "local"):
-    thread_local = threading.local
-    #class TL(object):
-    #    pass
-    #thread_local = TL
-else:
-    class thread_local(object):
-        def __init__(self):
-            self._map = {}
-
-        def __getattr__(self, attr):
-            try:
-                return self._map[(threading.currentThread().ident, attr)]
-            except KeyError:
-                raise AttributeError(attr)
-
-        def __setattr__(self, attr, value):
-            self._map[(threading.currentThread().ident, attr)] = value
-
 
 if not hasattr(paramiko.SFTPFile, "__enter__"):
     paramiko.SFTPFile.__enter__ = lambda self: self
@@ -80,7 +66,8 @@ class SFTPFS(FS):
                  pkey=None,
                  agent_auth=True,
                  no_auth=False,
-                 look_for_keys=True):
+                 look_for_keys=True,
+                 max_pool_size=-1):
         """SFTPFS constructor.
 
         The only required argument is 'connection', which must be something
@@ -120,7 +107,6 @@ class SFTPFS(FS):
         self.closed = False
         self._owns_transport = False
         self._credentials = credentials
-        self._tlocal = thread_local()
         self._transport = None
         self._client = None
 
@@ -192,6 +178,9 @@ class SFTPFS(FS):
 
         self._transport = connection
 
+        self.pool = Queue.Queue(maxsize=max_pool_size)
+        self.pool_count = 0
+
     def __unicode__(self):
         return u'<SFTPFS: %s>' % self.desc('/')
 
@@ -253,49 +242,61 @@ class SFTPFS(FS):
     @synchronize
     def __getstate__(self):
         state = super(SFTPFS,self).__getstate__()
-        del state["_tlocal"]
         if self._owns_transport:
             state['_transport'] = self._transport.getpeername()
         return state
 
     def __setstate__(self,state):
         super(SFTPFS, self).__setstate__(state)
-        #for (k,v) in state.iteritems():
-        #    self.__dict__[k] = v
-        #self._lock = threading.RLock()
-        self._tlocal = thread_local()
         if self._owns_transport:
             self._transport = paramiko.Transport(self._transport)
             self._transport.connect(**self._credentials)
 
     @property
-    @synchronize
+    @contextlib.contextmanager
     def client(self):
-        if self.closed:
-            return None
-        client = getattr(self._tlocal, 'client', None)
-        if client is None:
+        managed = False
+        result = None
+        if not self.closed:
             if self._transport is None:
-                return self._client
-            client = paramiko.SFTPClient.from_transport(self._transport)
-            self._tlocal.client = client
+                result = self._client
+            else:
+                managed = True
+                result = self._get_pool_client()
+        yield result
+        if managed:
+            self.pool.put(result)
+
+    @synchronize
+    def _get_pool_client(self):
+        # get a connection from the pool
+        try:
+            client  = self.pool.get_nowait()
+        except Queue.Empty:
+            if not self.pool.maxsize or self.pool_count < self.pool.maxsize:
+                self.pool_count += 1
+                self.pool.put(paramiko.SFTPClient.from_transport(self._transport))
+                client = self.pool.get()
+            else:
+                retries = 5
+                while True:
+                    sleep(1.0)
+                    try:
+                        client = self.pool.get(block=False, timeout=1.0)
+                        break
+                    except (Queue.Empty, Queue.Timeout):
+                        retries -= 1
+                        if not retries:
+                            raise ValueError('No connections available')
+
         return client
-#        try:
-#            return self._tlocal.client
-#        except AttributeError:
-#            #if self._transport is None:
-#            #    return self._client
-#            client = paramiko.SFTPClient.from_transport(self._transport)
-#            self._tlocal.client = client
-#            return client
 
     @synchronize
     def close(self):
         """Close the connection to the remote server."""
         if not self.closed:
-            self._tlocal = None
-            #if self.client:
-            #    self.client.close()
+            for client in self.pool.get_nowait():
+                client.get_channel().close()
             if self._owns_transport and self._transport and self._transport.is_active:
                 self._transport.close()
             self.closed = True
@@ -332,7 +333,8 @@ class SFTPFS(FS):
             raise ResourceInvalidError(path,msg=msg)
         #  paramiko implements its own buffering and write-back logic,
         #  so we don't need to use a RemoteFileBuffer here.
-        f = self.client.open(npath,mode,bufsize)
+        client = self._get_pool_client()
+        f = client.open(npath,mode,bufsize)
         #  Unfortunately it has a broken truncate() method.
         #  TODO: implement this as a wrapper
         old_truncate = f.truncate
@@ -341,6 +343,12 @@ class SFTPFS(FS):
                 size = f.tell()
             return old_truncate(size)
         f.truncate = new_truncate
+        # wrap the close to release the client
+        old_close = f.close
+        def new_close():
+            # release client
+            self.pool.put(client)
+        f.close = new_close
         return f
 
     @synchronize
@@ -350,7 +358,8 @@ class SFTPFS(FS):
             return u'sftp://%s%s' % (self.hostname, path)
         else:
             addr, port = self._transport.getpeername()
-            return u'sftp://%s:%i%s' % (addr, port, self.client.normalize(npath))
+            with self.client as client:
+                return u'sftp://%s:%i%s' % (addr, port, client.normalize(npath))
 
     @synchronize
     @convert_os_errors
@@ -358,60 +367,64 @@ class SFTPFS(FS):
         if path in ('', '/'):
             return True
         npath = self._normpath(path)
-        try:
-            self.client.stat(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                return False
-            raise
-        return True
+        with self.client as client:
+            try:
+                client.stat(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    return False
+                raise
+            return True
 
     @synchronize
     @convert_os_errors
     def isdir(self,path):
-        if path in ('', '/'):
-            return True
-        npath = self._normpath(path)
-        try:
-            stat = self.client.stat(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                return False
-            raise
-        return statinfo.S_ISDIR(stat.st_mode)
+        with self.client as client:
+            if path in ('', '/'):
+                return True
+            npath = self._normpath(path)
+            try:
+                stat = client.stat(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    return False
+                raise
+            return statinfo.S_ISDIR(stat.st_mode)
 
     @synchronize
     @convert_os_errors
     def isfile(self,path):
         npath = self._normpath(path)
-        try:
-            stat = self.client.stat(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                return False
-            raise
-        return statinfo.S_ISREG(stat.st_mode)
+        with self.client as client:
+            try:
+                stat = client.stat(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    return False
+                raise
+            return statinfo.S_ISREG(stat.st_mode)
 
     @synchronize
     @convert_os_errors
     def listdir(self,path="./",wildcard=None,full=False,absolute=False,dirs_only=False,files_only=False):
         npath = self._normpath(path)
-        try:
-            attrs_map = None
-            if dirs_only or files_only:
-                attrs = self.client.listdir_attr(npath)
-                attrs_map = dict((a.filename, a) for a in attrs)
-                paths = list(attrs_map.iterkeys())
-            else:
-                paths = self.client.listdir(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                if self.isfile(path):
+        with self.client as client:
+            try:
+                attrs_map = None
+                if dirs_only or files_only:
+                    attrs = client.listdir_attr(npath)
+                    attrs_map = dict((a.filename, a) for a in attrs)
+                    paths = list(attrs_map.iterkeys())
+                else:
+                    paths = client.listdir(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    if self.isfile(path):
+                        raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
+                    raise ResourceNotFoundError(path)
+                elif self.isfile(path):
                     raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
-                raise ResourceNotFoundError(path)
-            elif self.isfile(path):
-                raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
-            raise
+                raise
 
         if attrs_map:
             if dirs_only:
@@ -437,18 +450,19 @@ class SFTPFS(FS):
     @convert_os_errors
     def listdirinfo(self,path="./",wildcard=None,full=False,absolute=False,dirs_only=False,files_only=False):
         npath = self._normpath(path)
-        try:
-            attrs = self.client.listdir_attr(npath)
-            attrs_map = dict((a.filename, a) for a in attrs)
-            paths = attrs_map.keys()
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                if self.isfile(path):
+        with self.client as client:
+            try:
+                attrs = client.listdir_attr(npath)
+                attrs_map = dict((a.filename, a) for a in attrs)
+                paths = attrs_map.keys()
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    if self.isfile(path):
+                        raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
+                    raise ResourceNotFoundError(path)
+                elif self.isfile(path):
                     raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
-                raise ResourceNotFoundError(path)
-            elif self.isfile(path):
-                raise ResourceInvalidError(path,msg="Can't list directory contents of a file: %(path)s")
-            raise
+                raise
 
         if dirs_only:
             filter_paths = []
@@ -481,42 +495,44 @@ class SFTPFS(FS):
     @convert_os_errors
     def makedir(self,path,recursive=False,allow_recreate=False):
         npath = self._normpath(path)
-        try:
-            self.client.mkdir(npath)
-        except IOError, _e:
-            # Error code is unreliable, try to figure out what went wrong
+        with self.client as client:
             try:
-                stat = self.client.stat(npath)
-            except IOError:
-                if not self.isdir(dirname(path)):
-                    # Parent dir is missing
-                    if not recursive:
-                        raise ParentDirectoryMissingError(path)
-                    self.makedir(dirname(path),recursive=True)
-                    self.makedir(path,allow_recreate=allow_recreate)
+                client.mkdir(npath)
+            except IOError, _e:
+                # Error code is unreliable, try to figure out what went wrong
+                try:
+                    stat = client.stat(npath)
+                except IOError:
+                    if not self.isdir(dirname(path)):
+                        # Parent dir is missing
+                        if not recursive:
+                            raise ParentDirectoryMissingError(path)
+                        self.makedir(dirname(path),recursive=True)
+                        self.makedir(path,allow_recreate=allow_recreate)
+                    else:
+                        # Undetermined error, let the decorator handle it
+                        raise
                 else:
-                    # Undetermined error, let the decorator handle it
-                    raise
-            else:
-                # Destination exists
-                if statinfo.S_ISDIR(stat.st_mode):
-                    if not allow_recreate:
-                        raise DestinationExistsError(path,msg="Can't create a directory that already exists (try allow_recreate=True): %(path)s")
-                else:
-                    raise ResourceInvalidError(path,msg="Can't create directory, there's already a file of that name: %(path)s")
+                    # Destination exists
+                    if statinfo.S_ISDIR(stat.st_mode):
+                        if not allow_recreate:
+                            raise DestinationExistsError(path,msg="Can't create a directory that already exists (try allow_recreate=True): %(path)s")
+                    else:
+                        raise ResourceInvalidError(path,msg="Can't create directory, there's already a file of that name: %(path)s")
 
     @synchronize
     @convert_os_errors
     def remove(self,path):
         npath = self._normpath(path)
-        try:
-            self.client.remove(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                raise ResourceNotFoundError(path)
-            elif self.isdir(path):
-                raise ResourceInvalidError(path,msg="Cannot use remove() on a directory: %(path)s")
-            raise
+        with self.client as client:
+            try:
+                client.remove(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    raise ResourceNotFoundError(path)
+                elif self.isdir(path):
+                    raise ResourceInvalidError(path,msg="Cannot use remove() on a directory: %(path)s")
+                raise
 
     @synchronize
     @convert_os_errors
@@ -532,36 +548,38 @@ class SFTPFS(FS):
                     self.removedir(path2,force=True)
         if not self.exists(path):
             raise ResourceNotFoundError(path)
-        try:
-            self.client.rmdir(npath)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                if self.isfile(path):
-                    raise ResourceInvalidError(path,msg="Can't use removedir() on a file: %(path)s")
-                raise ResourceNotFoundError(path)
-
-            elif self.listdir(path):
-                raise DirectoryNotEmptyError(path)
-            raise
-        if recursive:
+        with self.client as client:
             try:
-                self.removedir(dirname(path),recursive=True)
-            except DirectoryNotEmptyError:
-                pass
+                client.rmdir(npath)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    if self.isfile(path):
+                        raise ResourceInvalidError(path,msg="Can't use removedir() on a file: %(path)s")
+                    raise ResourceNotFoundError(path)
+
+                elif self.listdir(path):
+                    raise DirectoryNotEmptyError(path)
+                raise
+            if recursive:
+                try:
+                    self.removedir(dirname(path),recursive=True)
+                except DirectoryNotEmptyError:
+                    pass
 
     @synchronize
     @convert_os_errors
     def rename(self,src,dst):
         nsrc = self._normpath(src)
         ndst = self._normpath(dst)
-        try:
-            self.client.rename(nsrc,ndst)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                raise ResourceNotFoundError(src)
-            if not self.isdir(dirname(dst)):
-                raise ParentDirectoryMissingError(dst)
-            raise
+        with self.client as client:
+            try:
+                client.rename(nsrc,ndst)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    raise ResourceNotFoundError(src)
+                if not self.isdir(dirname(dst)):
+                    raise ParentDirectoryMissingError(dst)
+                raise
 
     @synchronize
     @convert_os_errors
@@ -570,16 +588,17 @@ class SFTPFS(FS):
         ndst = self._normpath(dst)
         if overwrite and self.isfile(dst):
             self.remove(dst)
-        try:
-            self.client.rename(nsrc,ndst)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                raise ResourceNotFoundError(src)
-            if self.exists(dst):
-                raise DestinationExistsError(dst)
-            if not self.isdir(dirname(dst)):
-                raise ParentDirectoryMissingError(dst,msg="Destination directory does not exist: %(path)s")
-            raise
+        with self.client as client:
+            try:
+                client.rename(nsrc,ndst)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    raise ResourceNotFoundError(src)
+                if self.exists(dst):
+                    raise DestinationExistsError(dst)
+                if not self.isdir(dirname(dst)):
+                    raise ParentDirectoryMissingError(dst,msg="Destination directory does not exist: %(path)s")
+                raise
 
     @synchronize
     @convert_os_errors
@@ -588,16 +607,17 @@ class SFTPFS(FS):
         ndst = self._normpath(dst)
         if overwrite and self.isdir(dst):
             self.removedir(dst)
-        try:
-            self.client.rename(nsrc,ndst)
-        except IOError, e:
-            if getattr(e,"errno",None) == 2:
-                raise ResourceNotFoundError(src)
-            if self.exists(dst):
-                raise DestinationExistsError(dst)
-            if not self.isdir(dirname(dst)):
-                raise ParentDirectoryMissingError(dst,msg="Destination directory does not exist: %(path)s")
-            raise
+        with self.client as client:
+            try:
+                client.rename(nsrc,ndst)
+            except IOError, e:
+                if getattr(e,"errno",None) == 2:
+                    raise ResourceNotFoundError(src)
+                if self.exists(dst):
+                    raise DestinationExistsError(dst)
+                if not self.isdir(dirname(dst)):
+                    raise ParentDirectoryMissingError(dst,msg="Destination directory does not exist: %(path)s")
+                raise
 
     _info_vars = frozenset('st_size st_uid st_gid st_mode st_atime st_mtime'.split())
     @classmethod
@@ -620,23 +640,25 @@ class SFTPFS(FS):
     @convert_os_errors
     def getinfo(self, path):
         npath = self._normpath(path)
-        stats = self.client.stat(npath)
-        info = dict((k, getattr(stats, k)) for k in dir(stats) if not k.startswith('_'))
-        info['size'] = info['st_size']
-        ct = info.get('st_ctime', None)
-        if ct is not None:
-            info['created_time'] = datetime.datetime.fromtimestamp(ct)
-        at = info.get('st_atime', None)
-        if at is not None:
-            info['accessed_time'] = datetime.datetime.fromtimestamp(at)
-        mt = info.get('st_mtime', None)
-        if mt is not None:
-            info['modified_time'] = datetime.datetime.fromtimestamp(mt)
-        return info
+        with self.client as client:
+            stats = client.stat(npath)
+            info = dict((k, getattr(stats, k)) for k in dir(stats) if not k.startswith('_'))
+            info['size'] = info['st_size']
+            ct = info.get('st_ctime', None)
+            if ct is not None:
+                info['created_time'] = datetime.datetime.fromtimestamp(ct)
+            at = info.get('st_atime', None)
+            if at is not None:
+                info['accessed_time'] = datetime.datetime.fromtimestamp(at)
+            mt = info.get('st_mtime', None)
+            if mt is not None:
+                info['modified_time'] = datetime.datetime.fromtimestamp(mt)
+            return info
 
     @synchronize
     @convert_os_errors
     def getsize(self, path):
         npath = self._normpath(path)
-        stats = self.client.stat(npath)
-        return stats.st_size
+        with self.client as client:
+            stats = client.stat(npath)
+            return stats.st_size
