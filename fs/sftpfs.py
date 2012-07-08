@@ -263,9 +263,11 @@ class SFTPFS(FS):
             else:
                 managed = True
                 result = self._get_pool_client()
-        yield result
-        if managed:
-            self.pool.put(result)
+        try:
+            yield result
+        finally:
+            if managed:
+                self.pool.put(result)
 
     @synchronize
     def _get_pool_client(self):
@@ -339,7 +341,13 @@ class SFTPFS(FS):
         #  paramiko implements its own buffering and write-back logic,
         #  so we don't need to use a RemoteFileBuffer here.
         client = self._get_pool_client()
-        f = client.open(npath,mode,bufsize)
+        try:
+            f = client.open(npath,mode,bufsize)
+        except Exception:
+            # release client if any error
+            self.pool.put(client)
+            raise
+
         #  Unfortunately it has a broken truncate() method.
         #  TODO: implement this as a wrapper
         old_truncate = f.truncate
