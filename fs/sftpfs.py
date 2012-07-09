@@ -14,6 +14,12 @@ if 'gevent.monkey' in sys.modules:
 else:
     import Queue
     from time import sleep
+
+    class Timeout(Exception):
+        """dummy Timeout - not used by python"""
+        pass
+    Queue.Timeout = Timeout
+
 import contextlib
 
 import datetime
@@ -28,6 +34,10 @@ from fs.errors import *
 from fs.utils import isdir, isfile
 
 class WrongHostKeyError(RemoteConnectionError):
+    pass
+
+class NoConnectionError(RemoteConnectionError):
+    """Unable to create a new connection - pool exhausted"""
     pass
 
 if not hasattr(paramiko.SFTPFile, "__enter__"):
@@ -67,7 +77,7 @@ class SFTPFS(FS):
                  agent_auth=True,
                  no_auth=False,
                  look_for_keys=True,
-                 max_pool_size=-1):
+                 max_pool_size=0):
         """SFTPFS constructor.
 
         The only required argument is 'connection', which must be something
@@ -93,6 +103,9 @@ class SFTPFS(FS):
         :param no_auth: attempt to log in without any kind of authorization
         :param look_for_keys: Look for keys in the same locations as ssh,
             if other authentication is not succesful
+        :param max_pool_size: <=0 ==> infinite pool (unless using gevent, where
+            ``Queue(0)`` is a channel, that is, its :meth:`put` method always blocks until the
+            item is delivered. When pool is exhausted a NoConnectionError will be raised.
 
         """
 
@@ -119,6 +132,7 @@ class SFTPFS(FS):
         super(SFTPFS, self).__init__()
         self.root_path = abspath(normpath(root_path))
 
+        max_pool_size = max(max_pool_size, 0)
         self.pool = Queue.Queue(maxsize=max_pool_size)
         self.pool_count = 0
 
@@ -289,7 +303,10 @@ class SFTPFS(FS):
                     except (Queue.Empty, Queue.Timeout):
                         retries -= 1
                         if not retries:
-                            raise ValueError('No connections available')
+                            raise NoConnectionError(
+                                'No available connection in pool. Max '
+                                'size:%s, current size:%s' %(
+                                    self.pool.maxsize, self.pool.qsize()))
 
         return client
 
