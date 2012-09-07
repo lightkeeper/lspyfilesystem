@@ -40,7 +40,7 @@ class ReadOnlyFS(WrapFS):
     
     def open(self, path, mode='r', **kwargs):
         """ Only permit read access """
-        if 'w' in mode or 'a' in mode:
+        if 'w' in mode or 'a' in mode or '+' in mode:
             raise UnsupportedError('write')
         return super(ReadOnlyFS, self).open(path, mode, **kwargs)
         
@@ -55,7 +55,7 @@ class ReadOnlyFS(WrapFS):
     makedir = _no_can_do
     rename = _no_can_do
     setxattr = _no_can_do
-    delattr = _no_can_do
+    delxattr = _no_can_do
     remove = _no_can_do
     removedir = _no_can_do
     settimes = _no_can_do

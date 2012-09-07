@@ -541,7 +541,7 @@ def print_fs(fs,
                             [(False, p) for p in files] )
         except Exception, e:
             prefix = ''.join([(char_vertline + '   ', '    ')[last] for last in levels]) + '   '
-            write(wrap_prefix(prefix[:-1] + '    ') + wrap_error("unabled to retrieve directory list (%s) ..." % str(e)))
+            write(wrap_prefix(prefix[:-1] + '    ') + wrap_error("unable to retrieve directory list (%s) ..." % str(e)))
             return 0
 
         if hide_dotfiles:
@@ -582,10 +582,11 @@ def print_fs(fs,
 
 if __name__ == "__main__":
     from fs.tempfs import TempFS
+    from six import b
     t1 = TempFS()
-    t1.setcontents("foo", "test")
+    t1.setcontents("foo", b("test"))
     t1.makedir("bar")
-    t1.setcontents("bar/baz", "another test")
+    t1.setcontents("bar/baz", b("another test"))
 
     t1.tree()
 
