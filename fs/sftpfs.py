@@ -376,6 +376,7 @@ class SFTPFS(FS):
         # wrap the close to release the client
         old_close = f.close
         def new_close():
+            old_close()
             # release client
             self.pool.put(client)
         f.close = new_close
